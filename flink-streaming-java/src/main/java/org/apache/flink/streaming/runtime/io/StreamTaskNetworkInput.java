@@ -19,6 +19,7 @@
 package org.apache.flink.streaming.runtime.io;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.runtime.event.AbstractEvent;
 import org.apache.flink.runtime.io.disk.iomanager.IOManager;
@@ -42,12 +43,12 @@ import java.util.concurrent.CompletableFuture;
 import static org.apache.flink.util.Preconditions.checkState;
 
 /**
- * Implementation of {@link StreamTaskInput} that wraps an input from network taken from {@link CheckpointBarrierHandler}.
+ * Implementation of {@link StreamTaskInput} that wraps an input from network taken from {@link CheckpointedInputGate}.
  */
 @Internal
 public final class StreamTaskNetworkInput implements StreamTaskInput {
 
-	private final CheckpointBarrierHandler barrierHandler;
+	private final CheckpointedInputGate checkpointedInputGate;
 
 	private final DeserializationDelegate<StreamElement> deserializationDelegate;
 
@@ -63,21 +64,36 @@ public final class StreamTaskNetworkInput implements StreamTaskInput {
 
 	@SuppressWarnings("unchecked")
 	public StreamTaskNetworkInput(
-			CheckpointBarrierHandler barrierHandler,
+			CheckpointedInputGate checkpointedInputGate,
 			TypeSerializer<?> inputSerializer,
 			IOManager ioManager,
 			int inputIndex) {
-		this.barrierHandler = barrierHandler;
+		this.checkpointedInputGate = checkpointedInputGate;
 		this.deserializationDelegate = new NonReusingDeserializationDelegate<>(
 			new StreamElementSerializer<>(inputSerializer));
 
 		// Initialize one deserializer per input channel
-		this.recordDeserializers = new SpillingAdaptiveSpanningRecordDeserializer[barrierHandler.getNumberOfInputChannels()];
+		this.recordDeserializers = new SpillingAdaptiveSpanningRecordDeserializer[checkpointedInputGate.getNumberOfInputChannels()];
 		for (int i = 0; i < recordDeserializers.length; i++) {
 			recordDeserializers[i] = new SpillingAdaptiveSpanningRecordDeserializer<>(
 				ioManager.getSpillingDirectoriesPaths());
 		}
 
+		this.inputIndex = inputIndex;
+	}
+
+	@VisibleForTesting
+	StreamTaskNetworkInput(
+		CheckpointedInputGate checkpointedInputGate,
+		TypeSerializer<?> inputSerializer,
+		IOManager ioManager,
+		int inputIndex,
+		RecordDeserializer<DeserializationDelegate<StreamElement>>[] recordDeserializers) {
+
+		this.checkpointedInputGate = checkpointedInputGate;
+		this.deserializationDelegate = new NonReusingDeserializationDelegate<>(
+			new StreamElementSerializer<>(inputSerializer));
+		this.recordDeserializers = recordDeserializers;
 		this.inputIndex = inputIndex;
 	}
 
@@ -99,14 +115,14 @@ public final class StreamTaskNetworkInput implements StreamTaskInput {
 				}
 			}
 
-			Optional<BufferOrEvent> bufferOrEvent = barrierHandler.pollNext();
+			Optional<BufferOrEvent> bufferOrEvent = checkpointedInputGate.pollNext();
 			if (bufferOrEvent.isPresent()) {
 				processBufferOrEvent(bufferOrEvent.get());
 			} else {
-				if (barrierHandler.isFinished()) {
+				if (checkpointedInputGate.isFinished()) {
 					isFinished = true;
-					checkState(barrierHandler.isAvailable().isDone(), "Finished BarrierHandler should be available");
-					if (!barrierHandler.isEmpty()) {
+					checkState(checkpointedInputGate.isAvailable().isDone(), "Finished BarrierHandler should be available");
+					if (!checkpointedInputGate.isEmpty()) {
 						throw new IllegalStateException("Trailing data in checkpoint barrier handler.");
 					}
 				}
@@ -119,15 +135,22 @@ public final class StreamTaskNetworkInput implements StreamTaskInput {
 		if (bufferOrEvent.isBuffer()) {
 			lastChannel = bufferOrEvent.getChannelIndex();
 			currentRecordDeserializer = recordDeserializers[lastChannel];
+			checkState(currentRecordDeserializer != null,
+				"currentRecordDeserializer has already been released");
+
 			currentRecordDeserializer.setNextBuffer(bufferOrEvent.getBuffer());
 		}
 		else {
 			// Event received
 			final AbstractEvent event = bufferOrEvent.getEvent();
-			// TODO: with barrierHandler.isFinished() we might not need to support any events on this level.
+			// TODO: with checkpointedInputGate.isFinished() we might not need to support any events on this level.
 			if (event.getClass() != EndOfPartitionEvent.class) {
 				throw new IOException("Unexpected event: " + event);
 			}
+
+			// release the record deserializer immediately,
+			// which is very valuable in case of bounded stream
+			releaseDeserializer(bufferOrEvent.getChannelIndex());
 		}
 	}
 
@@ -148,20 +171,34 @@ public final class StreamTaskNetworkInput implements StreamTaskInput {
 
 	@Override
 	public CompletableFuture<?> isAvailable() {
-		return barrierHandler.isAvailable();
+		if (currentRecordDeserializer != null) {
+			return AVAILABLE;
+		}
+		return checkpointedInputGate.isAvailable();
 	}
 
 	@Override
 	public void close() throws IOException {
-		// clear the buffers. this part should not ever fail
-		for (RecordDeserializer<?> deserializer : recordDeserializers) {
+		// release the deserializers . this part should not ever fail
+		for (int channelIndex = 0; channelIndex < recordDeserializers.length; channelIndex++) {
+			releaseDeserializer(channelIndex);
+		}
+
+		// cleanup the resources of the checkpointed input gate
+		checkpointedInputGate.cleanup();
+	}
+
+	private void releaseDeserializer(int channelIndex) {
+		RecordDeserializer<?> deserializer = recordDeserializers[channelIndex];
+		if (deserializer != null) {
+			// recycle buffers and clear the deserializer.
 			Buffer buffer = deserializer.getCurrentBuffer();
 			if (buffer != null && !buffer.isRecycled()) {
 				buffer.recycleBuffer();
 			}
 			deserializer.clear();
-		}
 
-		barrierHandler.cleanup();
+			recordDeserializers[channelIndex] = null;
+		}
 	}
 }

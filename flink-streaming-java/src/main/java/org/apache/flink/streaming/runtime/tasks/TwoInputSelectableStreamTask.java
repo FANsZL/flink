@@ -21,10 +21,15 @@ import org.apache.flink.annotation.Internal;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.runtime.execution.Environment;
 import org.apache.flink.runtime.io.network.partition.consumer.InputGate;
+import org.apache.flink.streaming.api.operators.InputSelectable;
 import org.apache.flink.streaming.api.operators.TwoInputStreamOperator;
 import org.apache.flink.streaming.runtime.io.StreamTwoInputSelectableProcessor;
+import org.apache.flink.streaming.runtime.io.TwoInputSelectionHandler;
 
+import java.io.IOException;
 import java.util.Collection;
+
+import static org.apache.flink.util.Preconditions.checkState;
 
 /**
  * A {@link StreamTask} for executing a {@link TwoInputStreamOperator} and supporting
@@ -32,8 +37,6 @@ import java.util.Collection;
  */
 @Internal
 public class TwoInputSelectableStreamTask<IN1, IN2, OUT> extends AbstractTwoInputStreamTask<IN1, IN2, OUT> {
-
-	private StreamTwoInputSelectableProcessor<IN1, IN2> inputProcessor;
 
 	public TwoInputSelectableStreamTask(Environment env) {
 		super(env);
@@ -44,36 +47,26 @@ public class TwoInputSelectableStreamTask<IN1, IN2, OUT> extends AbstractTwoInpu
 		Collection<InputGate> inputGates1,
 		Collection<InputGate> inputGates2,
 		TypeSerializer<IN1> inputDeserializer1,
-		TypeSerializer<IN2> inputDeserializer2) {
+		TypeSerializer<IN2> inputDeserializer2) throws IOException {
+
+		checkState(headOperator instanceof InputSelectable);
+		TwoInputSelectionHandler twoInputSelectionHandler = new TwoInputSelectionHandler((InputSelectable) headOperator);
 
 		this.inputProcessor = new StreamTwoInputSelectableProcessor<>(
 			inputGates1, inputGates2,
 			inputDeserializer1, inputDeserializer2,
 			this,
+			getConfiguration().getCheckpointMode(),
+			getCheckpointLock(),
 			getEnvironment().getIOManager(),
+			getEnvironment().getTaskManagerInfo().getConfiguration(),
 			getStreamStatusMaintainer(),
 			this.headOperator,
+			twoInputSelectionHandler,
 			input1WatermarkGauge,
 			input2WatermarkGauge,
-			operatorChain);
-	}
-
-	@Override
-	protected void performDefaultAction(ActionContext context) throws Exception {
-		if (!inputProcessor.processInput()) {
-			context.allActionsCompleted();
-		}
-	}
-
-	@Override
-	protected void cleanup() throws Exception {
-		if (inputProcessor != null) {
-			inputProcessor.cleanup();
-		}
-	}
-
-	@Override
-	protected void cancelTask() {
-
+			getTaskNameWithSubtaskAndId(),
+			operatorChain,
+			setupNumRecordsInCounter(headOperator));
 	}
 }

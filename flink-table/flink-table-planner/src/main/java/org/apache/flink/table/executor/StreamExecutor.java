@@ -19,9 +19,10 @@
 package org.apache.flink.table.executor;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.JobExecutionResult;
+import org.apache.flink.api.dag.Transformation;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.flink.streaming.api.transformations.StreamTransformation;
 import org.apache.flink.table.delegation.Executor;
 
 import java.util.List;
@@ -34,12 +35,13 @@ import java.util.List;
 public class StreamExecutor implements Executor {
 	private final StreamExecutionEnvironment executionEnvironment;
 
-	StreamExecutor(StreamExecutionEnvironment executionEnvironment) {
+	@VisibleForTesting
+	public StreamExecutor(StreamExecutionEnvironment executionEnvironment) {
 		this.executionEnvironment = executionEnvironment;
 	}
 
 	@Override
-	public void apply(List<StreamTransformation<?>> transformations) {
+	public void apply(List<Transformation<?>> transformations) {
 		transformations.forEach(executionEnvironment::addOperator);
 	}
 

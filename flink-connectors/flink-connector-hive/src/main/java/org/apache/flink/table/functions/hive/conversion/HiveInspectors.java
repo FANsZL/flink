@@ -19,6 +19,8 @@
 package org.apache.flink.table.functions.hive.conversion;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.table.catalog.exceptions.CatalogException;
 import org.apache.flink.table.catalog.hive.util.HiveTypeUtil;
 import org.apache.flink.table.functions.hive.FlinkHiveUDFException;
 import org.apache.flink.table.types.DataType;
@@ -37,6 +39,7 @@ import org.apache.hadoop.hive.serde2.io.ByteWritable;
 import org.apache.hadoop.hive.serde2.io.DateWritable;
 import org.apache.hadoop.hive.serde2.io.DoubleWritable;
 import org.apache.hadoop.hive.serde2.io.HiveCharWritable;
+import org.apache.hadoop.hive.serde2.io.HiveDecimalWritable;
 import org.apache.hadoop.hive.serde2.io.HiveVarcharWritable;
 import org.apache.hadoop.hive.serde2.io.ShortWritable;
 import org.apache.hadoop.hive.serde2.io.TimestampWritable;
@@ -44,6 +47,7 @@ import org.apache.hadoop.hive.serde2.objectinspector.ConstantObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.ListObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.MapObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
+import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorFactory;
 import org.apache.hadoop.hive.serde2.objectinspector.PrimitiveObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.StandardStructObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.StructField;
@@ -55,6 +59,7 @@ import org.apache.hadoop.hive.serde2.objectinspector.primitive.DateObjectInspect
 import org.apache.hadoop.hive.serde2.objectinspector.primitive.DoubleObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.primitive.FloatObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.primitive.HiveCharObjectInspector;
+import org.apache.hadoop.hive.serde2.objectinspector.primitive.HiveDecimalObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.primitive.HiveVarcharObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.primitive.IntObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.primitive.JavaConstantBinaryObjectInspector;
@@ -77,7 +82,10 @@ import org.apache.hadoop.hive.serde2.objectinspector.primitive.ShortObjectInspec
 import org.apache.hadoop.hive.serde2.objectinspector.primitive.StringObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.primitive.TimestampObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.primitive.VoidObjectInspector;
+import org.apache.hadoop.hive.serde2.typeinfo.ListTypeInfo;
+import org.apache.hadoop.hive.serde2.typeinfo.MapTypeInfo;
 import org.apache.hadoop.hive.serde2.typeinfo.PrimitiveTypeInfo;
+import org.apache.hadoop.hive.serde2.typeinfo.StructTypeInfo;
 import org.apache.hadoop.hive.serde2.typeinfo.TypeInfo;
 import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoFactory;
 import org.apache.hadoop.hive.serde2.typeinfo.TypeInfoUtils;
@@ -88,6 +96,7 @@ import org.apache.hadoop.io.IntWritable;
 import org.apache.hadoop.io.LongWritable;
 import org.apache.hadoop.io.Text;
 
+import java.math.BigDecimal;
 import java.sql.Date;
 import java.sql.Timestamp;
 import java.util.ArrayList;
@@ -159,7 +168,6 @@ public class HiveInspectors {
 			case TIMESTAMP:
 				return new JavaConstantTimestampObjectInspector((Timestamp) value);
 			case DECIMAL:
-				// TODO: Needs more testing
 				return new JavaConstantHiveDecimalObjectInspector((HiveDecimal) value);
 			case BINARY:
 				return new JavaConstantBinaryObjectInspector((byte[]) value);
@@ -194,9 +202,9 @@ public class HiveInspectors {
 				return o -> new HiveChar((String) o, ((CharType) dataType).getLength());
 			} else if (inspector instanceof HiveVarcharObjectInspector) {
 				return o -> new HiveVarchar((String) o, ((VarCharType) dataType).getLength());
+			} else if (inspector instanceof HiveDecimalObjectInspector) {
+				return o -> o == null ? null : HiveDecimal.create((BigDecimal) o);
 			}
-
-			// TODO: handle decimal type
 		}
 
 		if (inspector instanceof ListObjectInspector) {
@@ -293,9 +301,11 @@ public class HiveInspectors {
 				HiveVarcharObjectInspector oi = (HiveVarcharObjectInspector) inspector;
 
 				return oi.getPrimitiveJavaObject(data).getValue();
-			}
+			} else if (inspector instanceof HiveDecimalObjectInspector) {
+				HiveDecimalObjectInspector oi = (HiveDecimalObjectInspector) inspector;
 
-			// TODO: handle decimal type
+				return oi.getPrimitiveJavaObject(data).bigDecimalValue();
+			}
 		}
 
 		if (inspector instanceof ListObjectInspector) {
@@ -322,21 +332,24 @@ public class HiveInspectors {
 			return result;
 		}
 
-		if (inspector instanceof StandardStructObjectInspector) {
-			StandardStructObjectInspector structInspector = (StandardStructObjectInspector) inspector;
+		if (inspector instanceof StructObjectInspector) {
+			StructObjectInspector structInspector = (StructObjectInspector) inspector;
 
 			List<? extends StructField> fields = structInspector.getAllStructFieldRefs();
 
 			Row row = new Row(fields.size());
+			// StandardStructObjectInspector.getStructFieldData in Hive-1.2.1 only accepts array or list as data
+			if (!data.getClass().isArray() && !(data instanceof List) && (inspector instanceof StandardStructObjectInspector)) {
+				data = new Object[]{data};
+			}
 			for (int i = 0; i < row.getArity(); i++) {
 				row.setField(
 					i,
 					toFlinkObject(
-						fields.get(i).getFieldObjectInspector(),
-						structInspector.getStructFieldData(data, fields.get(i)))
+							fields.get(i).getFieldObjectInspector(),
+							structInspector.getStructFieldData(data, fields.get(i)))
 				);
 			}
-
 			return row;
 		}
 
@@ -386,6 +399,9 @@ public class HiveInspectors {
 		} else if (clazz.equals(HiveVarchar.class) || clazz.equals(HiveVarcharWritable.class)) {
 
 			typeInfo = TypeInfoFactory.varcharTypeInfo;
+		} else if (clazz.equals(HiveDecimal.class) || clazz.equals(HiveDecimalWritable.class)) {
+
+			typeInfo = TypeInfoFactory.decimalTypeInfo;
 		} else {
 			throw new FlinkHiveUDFException(
 				String.format("Class %s is not supported yet", clazz.getName()));
@@ -394,14 +410,40 @@ public class HiveInspectors {
 		return getObjectInspector(typeInfo);
 	}
 
+	/**
+	 * Get Hive {@link ObjectInspector} for a Flink {@link TypeInformation}.
+	 */
+	public static ObjectInspector getObjectInspector(DataType flinkType) {
+		return getObjectInspector(HiveTypeUtil.toHiveTypeInfo(flinkType));
+	}
+
 	private static ObjectInspector getObjectInspector(TypeInfo type) {
 		switch (type.getCategory()) {
+
 			case PRIMITIVE:
 				PrimitiveTypeInfo primitiveType = (PrimitiveTypeInfo) type;
 				return PrimitiveObjectInspectorFactory.getPrimitiveJavaObjectInspector(primitiveType);
+			case LIST:
+				ListTypeInfo listType = (ListTypeInfo) type;
+				return ObjectInspectorFactory.getStandardListObjectInspector(
+						getObjectInspector(listType.getListElementTypeInfo()));
+			case MAP:
+				MapTypeInfo mapType = (MapTypeInfo) type;
+				return ObjectInspectorFactory.getStandardMapObjectInspector(
+						getObjectInspector(mapType.getMapKeyTypeInfo()), getObjectInspector(mapType.getMapValueTypeInfo()));
+			case STRUCT:
+				StructTypeInfo structType = (StructTypeInfo) type;
+				List<TypeInfo> fieldTypes = structType.getAllStructFieldTypeInfos();
+
+				List<ObjectInspector> fieldInspectors = new ArrayList<ObjectInspector>();
+				for (TypeInfo fieldType : fieldTypes) {
+					fieldInspectors.add(getObjectInspector(fieldType));
+				}
+
+				return ObjectInspectorFactory.getStandardStructObjectInspector(
+						structType.getAllStructFieldNames(), fieldInspectors);
 			default:
-				throw new FlinkHiveUDFException(
-					String.format("TypeInfo %s is not supported yet", type));
+				throw new CatalogException("Unsupported Hive type category " + type.getCategory());
 		}
 	}
 

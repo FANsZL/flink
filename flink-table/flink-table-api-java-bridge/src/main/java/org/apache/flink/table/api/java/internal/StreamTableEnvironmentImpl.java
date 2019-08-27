@@ -19,32 +19,36 @@
 package org.apache.flink.table.api.java.internal;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.api.common.time.Time;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.api.dag.Transformation;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.api.java.typeutils.TupleTypeInfo;
 import org.apache.flink.api.java.typeutils.TypeExtractor;
 import org.apache.flink.streaming.api.TimeCharacteristic;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.flink.streaming.api.transformations.StreamTransformation;
+import org.apache.flink.table.api.EnvironmentSettings;
 import org.apache.flink.table.api.StreamQueryConfig;
 import org.apache.flink.table.api.Table;
 import org.apache.flink.table.api.TableConfig;
 import org.apache.flink.table.api.TableException;
 import org.apache.flink.table.api.Types;
 import org.apache.flink.table.api.ValidationException;
-import org.apache.flink.table.api.internal.PlannerFactory;
 import org.apache.flink.table.api.internal.TableEnvironmentImpl;
 import org.apache.flink.table.api.java.StreamTableEnvironment;
 import org.apache.flink.table.catalog.CatalogManager;
 import org.apache.flink.table.catalog.FunctionCatalog;
 import org.apache.flink.table.catalog.GenericInMemoryCatalog;
 import org.apache.flink.table.delegation.Executor;
+import org.apache.flink.table.delegation.ExecutorFactory;
 import org.apache.flink.table.delegation.Planner;
+import org.apache.flink.table.delegation.PlannerFactory;
 import org.apache.flink.table.descriptors.ConnectorDescriptor;
 import org.apache.flink.table.descriptors.StreamTableDescriptor;
 import org.apache.flink.table.expressions.Expression;
 import org.apache.flink.table.expressions.ExpressionParser;
+import org.apache.flink.table.factories.ComponentFactoryService;
 import org.apache.flink.table.functions.AggregateFunction;
 import org.apache.flink.table.functions.TableAggregateFunction;
 import org.apache.flink.table.functions.TableFunction;
@@ -60,6 +64,7 @@ import org.apache.flink.table.typeutils.FieldInfoUtils;
 import java.lang.reflect.Method;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -73,68 +78,64 @@ public final class StreamTableEnvironmentImpl extends TableEnvironmentImpl imple
 
 	private final StreamExecutionEnvironment executionEnvironment;
 
-	private StreamTableEnvironmentImpl(
+	public StreamTableEnvironmentImpl(
 			CatalogManager catalogManager,
 			FunctionCatalog functionCatalog,
 			TableConfig tableConfig,
 			StreamExecutionEnvironment executionEnvironment,
 			Planner planner,
-			Executor executor) {
-		super(catalogManager, tableConfig, executor, functionCatalog, planner);
+			Executor executor,
+			boolean isStreamingMode) {
+		super(catalogManager, tableConfig, executor, functionCatalog, planner, isStreamingMode);
 		this.executionEnvironment = executionEnvironment;
 	}
 
-	/**
-	 * Creates an instance of a {@link StreamTableEnvironment}. It uses the {@link StreamExecutionEnvironment} for
-	 * executing queries. This is also the {@link StreamExecutionEnvironment} that will be used when converting
-	 * from/to {@link DataStream}.
-	 *
-	 * @param tableConfig The configuration of the TableEnvironment.
-	 * @param executionEnvironment The {@link StreamExecutionEnvironment} of the TableEnvironment.
-	 */
-	public static StreamTableEnvironmentImpl create(
-			TableConfig tableConfig,
-			StreamExecutionEnvironment executionEnvironment) {
-		CatalogManager catalogManager = new CatalogManager(
-			tableConfig.getBuiltInCatalogName(),
-			new GenericInMemoryCatalog(tableConfig.getBuiltInCatalogName(), tableConfig.getBuiltInDatabaseName()));
-		return create(catalogManager, tableConfig, executionEnvironment);
-	}
+	public static StreamTableEnvironment create(
+			StreamExecutionEnvironment executionEnvironment,
+			EnvironmentSettings settings,
+			TableConfig tableConfig) {
 
-	/**
-	 * Creates an instance of a {@link StreamTableEnvironment}. It uses the {@link StreamExecutionEnvironment} for
-	 * executing queries. This is also the {@link StreamExecutionEnvironment} that will be used when converting
-	 * from/to {@link DataStream}.
-	 *
-	 * @param catalogManager The {@link CatalogManager} to use for storing and looking up {@link Table}s.
-	 * @param tableConfig The configuration of the TableEnvironment.
-	 * @param executionEnvironment The {@link StreamExecutionEnvironment} of the TableEnvironment.
-	 */
-	public static StreamTableEnvironmentImpl create(
-			CatalogManager catalogManager,
-			TableConfig tableConfig,
-			StreamExecutionEnvironment executionEnvironment) {
-		FunctionCatalog functionCatalog = new FunctionCatalog(
-			catalogManager.getCurrentCatalog(),
-			catalogManager.getCurrentDatabase());
-		Executor executor = lookupExecutor(executionEnvironment);
-		Planner planner = PlannerFactory.lookupPlanner(executor, tableConfig, functionCatalog, catalogManager);
+		if (!settings.isStreamingMode()) {
+			throw new TableException(
+				"StreamTableEnvironment can not run in batch mode for now, please use TableEnvironment.");
+		}
+
+		CatalogManager catalogManager = new CatalogManager(
+			settings.getBuiltInCatalogName(),
+			new GenericInMemoryCatalog(settings.getBuiltInCatalogName(), settings.getBuiltInDatabaseName()));
+
+		FunctionCatalog functionCatalog = new FunctionCatalog(catalogManager);
+
+		Map<String, String> executorProperties = settings.toExecutorProperties();
+		Executor executor = lookupExecutor(executorProperties, executionEnvironment);
+
+		Map<String, String> plannerProperties = settings.toPlannerProperties();
+		Planner planner = ComponentFactoryService.find(PlannerFactory.class, plannerProperties)
+			.create(plannerProperties, executor, tableConfig, functionCatalog, catalogManager);
+
 		return new StreamTableEnvironmentImpl(
 			catalogManager,
 			functionCatalog,
 			tableConfig,
 			executionEnvironment,
 			planner,
-			executor
+			executor,
+			settings.isStreamingMode()
 		);
 	}
 
-	private static Executor lookupExecutor(StreamExecutionEnvironment executionEnvironment) {
+	private static Executor lookupExecutor(
+			Map<String, String> executorProperties,
+			StreamExecutionEnvironment executionEnvironment) {
 		try {
-			Class<?> clazz = Class.forName("org.apache.flink.table.executor.ExecutorFactory");
-			Method createMethod = clazz.getMethod("create", StreamExecutionEnvironment.class);
+			ExecutorFactory executorFactory = ComponentFactoryService.find(ExecutorFactory.class, executorProperties);
+			Method createMethod = executorFactory.getClass()
+				.getMethod("create", Map.class, StreamExecutionEnvironment.class);
 
-			return (Executor) createMethod.invoke(null, executionEnvironment);
+			return (Executor) createMethod.invoke(
+				executorFactory,
+				executorProperties,
+				executionEnvironment);
 		} catch (Exception e) {
 			throw new TableException(
 				"Could not instantiate the executor. Make sure a planner module is on the classpath",
@@ -213,44 +214,54 @@ public final class StreamTableEnvironmentImpl extends TableEnvironmentImpl imple
 
 	@Override
 	public <T> DataStream<T> toAppendStream(Table table, Class<T> clazz) {
-		return toAppendStream(table, clazz, new StreamQueryConfig());
+		TypeInformation<T> typeInfo = extractTypeInformation(table, clazz);
+		return toAppendStream(table, typeInfo);
 	}
 
 	@Override
 	public <T> DataStream<T> toAppendStream(Table table, TypeInformation<T> typeInfo) {
-		return toAppendStream(table, typeInfo, new StreamQueryConfig());
-	}
-
-	@Override
-	public <T> DataStream<T> toAppendStream(
-			Table table,
-			Class<T> clazz,
-			StreamQueryConfig queryConfig) {
-		TypeInformation<T> typeInfo = extractTypeInformation(table, clazz);
-		return toAppendStream(table, typeInfo, queryConfig);
-	}
-
-	@Override
-	public <T> DataStream<T> toAppendStream(
-			Table table,
-			TypeInformation<T> typeInfo,
-			StreamQueryConfig queryConfig) {
 		OutputConversionModifyOperation modifyOperation = new OutputConversionModifyOperation(
 			table.getQueryOperation(),
 			TypeConversions.fromLegacyInfoToDataType(typeInfo),
 			OutputConversionModifyOperation.UpdateMode.APPEND);
-		queryConfigProvider.setConfig(queryConfig);
 		return toDataStream(table, modifyOperation);
 	}
 
 	@Override
+	public <T> DataStream<T> toAppendStream(
+			Table table,
+			Class<T> clazz,
+			StreamQueryConfig queryConfig) {
+		tableConfig.setIdleStateRetentionTime(
+			Time.milliseconds(queryConfig.getMinIdleStateRetentionTime()),
+			Time.milliseconds(queryConfig.getMaxIdleStateRetentionTime()));
+		return toAppendStream(table, clazz);
+	}
+
+	@Override
+	public <T> DataStream<T> toAppendStream(
+			Table table,
+			TypeInformation<T> typeInfo,
+			StreamQueryConfig queryConfig) {
+		tableConfig.setIdleStateRetentionTime(
+			Time.milliseconds(queryConfig.getMinIdleStateRetentionTime()),
+			Time.milliseconds(queryConfig.getMaxIdleStateRetentionTime()));
+		return toAppendStream(table, typeInfo);
+	}
+
+	@Override
 	public <T> DataStream<Tuple2<Boolean, T>> toRetractStream(Table table, Class<T> clazz) {
-		return toRetractStream(table, clazz, new StreamQueryConfig());
+		TypeInformation<T> typeInfo = extractTypeInformation(table, clazz);
+		return toRetractStream(table, typeInfo);
 	}
 
 	@Override
 	public <T> DataStream<Tuple2<Boolean, T>> toRetractStream(Table table, TypeInformation<T> typeInfo) {
-		return toRetractStream(table, typeInfo, new StreamQueryConfig());
+		OutputConversionModifyOperation modifyOperation = new OutputConversionModifyOperation(
+			table.getQueryOperation(),
+			wrapWithChangeFlag(typeInfo),
+			OutputConversionModifyOperation.UpdateMode.RETRACT);
+		return toDataStream(table, modifyOperation);
 	}
 
 	@Override
@@ -258,8 +269,10 @@ public final class StreamTableEnvironmentImpl extends TableEnvironmentImpl imple
 			Table table,
 			Class<T> clazz,
 			StreamQueryConfig queryConfig) {
-		TypeInformation<T> typeInfo = extractTypeInformation(table, clazz);
-		return toRetractStream(table, typeInfo, queryConfig);
+		tableConfig.setIdleStateRetentionTime(
+			Time.milliseconds(queryConfig.getMinIdleStateRetentionTime()),
+			Time.milliseconds(queryConfig.getMaxIdleStateRetentionTime()));
+		return toRetractStream(table, clazz);
 	}
 
 	@Override
@@ -267,17 +280,31 @@ public final class StreamTableEnvironmentImpl extends TableEnvironmentImpl imple
 			Table table,
 			TypeInformation<T> typeInfo,
 			StreamQueryConfig queryConfig) {
-		OutputConversionModifyOperation modifyOperation = new OutputConversionModifyOperation(
-			table.getQueryOperation(),
-			wrapWithChangeFlag(typeInfo),
-			OutputConversionModifyOperation.UpdateMode.RETRACT);
-		queryConfigProvider.setConfig(queryConfig);
-		return toDataStream(table, modifyOperation);
+		tableConfig.setIdleStateRetentionTime(
+			Time.milliseconds(queryConfig.getMinIdleStateRetentionTime()),
+			Time.milliseconds(queryConfig.getMaxIdleStateRetentionTime()));
+		return toRetractStream(table, typeInfo);
 	}
 
 	@Override
 	public StreamTableDescriptor connect(ConnectorDescriptor connectorDescriptor) {
 		return (StreamTableDescriptor) super.connect(connectorDescriptor);
+	}
+
+	@Override
+	public void sqlUpdate(String stmt, StreamQueryConfig config) {
+		tableConfig.setIdleStateRetentionTime(
+			Time.milliseconds(config.getMinIdleStateRetentionTime()),
+			Time.milliseconds(config.getMaxIdleStateRetentionTime()));
+		sqlUpdate(stmt);
+	}
+
+	@Override
+	public void insertInto(Table table, StreamQueryConfig queryConfig, String sinkPath, String... sinkPathContinued) {
+		tableConfig.setIdleStateRetentionTime(
+			Time.milliseconds(queryConfig.getMinIdleStateRetentionTime()),
+			Time.milliseconds(queryConfig.getMaxIdleStateRetentionTime()));
+		insertInto(table, sinkPath, sinkPathContinued);
 	}
 
 	/**
@@ -289,18 +316,23 @@ public final class StreamTableEnvironmentImpl extends TableEnvironmentImpl imple
 	}
 
 	private <T> DataStream<T> toDataStream(Table table, OutputConversionModifyOperation modifyOperation) {
-		List<StreamTransformation<?>> transformations = planner.translate(Collections.singletonList(modifyOperation));
+		List<Transformation<?>> transformations = planner.translate(Collections.singletonList(modifyOperation));
 
-		StreamTransformation<T> streamTransformation = getStreamTransformation(table, transformations);
+		Transformation<T> transformation = getTransformation(table, transformations);
 
-		executionEnvironment.addOperator(streamTransformation);
-		return new DataStream<>(executionEnvironment, streamTransformation);
+		executionEnvironment.addOperator(transformation);
+		return new DataStream<>(executionEnvironment, transformation);
 	}
 
 	@Override
 	protected void validateTableSource(TableSource<?> tableSource) {
 		super.validateTableSource(tableSource);
 		validateTimeCharacteristic(TableSourceValidation.hasRowtimeAttribute(tableSource));
+	}
+
+	@Override
+	protected boolean isEagerOperationTranslation() {
+		return true;
 	}
 
 	private <T> TypeInformation<T> extractTypeInformation(Table table, Class<T> clazz) {
@@ -317,9 +349,9 @@ public final class StreamTableEnvironmentImpl extends TableEnvironmentImpl imple
 	}
 
 	@SuppressWarnings("unchecked")
-	private <T> StreamTransformation<T> getStreamTransformation(
+	private <T> Transformation<T> getTransformation(
 		Table table,
-		List<StreamTransformation<?>> transformations) {
+		List<Transformation<?>> transformations) {
 		if (transformations.size() != 1) {
 			throw new TableException(String.format(
 				"Expected a single transformation for query: %s\n Got: %s",
@@ -327,7 +359,7 @@ public final class StreamTableEnvironmentImpl extends TableEnvironmentImpl imple
 				transformations));
 		}
 
-		return (StreamTransformation<T>) transformations.get(0);
+		return (Transformation<T>) transformations.get(0);
 	}
 
 	private <T> DataType wrapWithChangeFlag(TypeInformation<T> outputType) {

@@ -20,13 +20,11 @@ package org.apache.flink.streaming.runtime.io;
 
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
+import org.apache.flink.configuration.Configuration;
 import org.apache.flink.metrics.Counter;
-import org.apache.flink.metrics.SimpleCounter;
 import org.apache.flink.runtime.io.disk.iomanager.IOManager;
 import org.apache.flink.runtime.io.network.partition.consumer.InputGate;
-import org.apache.flink.runtime.metrics.groups.OperatorMetricGroup;
-import org.apache.flink.streaming.api.operators.InputSelectable;
-import org.apache.flink.streaming.api.operators.InputSelection;
+import org.apache.flink.streaming.api.CheckpointingMode;
 import org.apache.flink.streaming.api.operators.TwoInputStreamOperator;
 import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.runtime.metrics.WatermarkGauge;
@@ -36,6 +34,7 @@ import org.apache.flink.streaming.runtime.streamstatus.StatusWatermarkValve;
 import org.apache.flink.streaming.runtime.streamstatus.StreamStatus;
 import org.apache.flink.streaming.runtime.streamstatus.StreamStatusMaintainer;
 import org.apache.flink.streaming.runtime.tasks.OperatorChain;
+import org.apache.flink.streaming.runtime.tasks.StreamTask;
 import org.apache.flink.util.ExceptionUtils;
 
 import org.slf4j.Logger;
@@ -44,7 +43,6 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.util.Collection;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutionException;
 
 import static org.apache.flink.util.Preconditions.checkNotNull;
 import static org.apache.flink.util.Preconditions.checkState;
@@ -57,14 +55,15 @@ import static org.apache.flink.util.Preconditions.checkState;
  * @param <IN2> The type of the records that arrive on the second input
  */
 @Internal
-public class StreamTwoInputSelectableProcessor<IN1, IN2> {
+public final class StreamTwoInputSelectableProcessor<IN1, IN2> implements StreamInputProcessor {
 
 	private static final Logger LOG = LoggerFactory.getLogger(StreamTwoInputSelectableProcessor.class);
 
 	private static final CompletableFuture<?> UNAVAILABLE = new CompletableFuture<>();
 
 	private final TwoInputStreamOperator<IN1, IN2, ?> streamOperator;
-	private final InputSelectable inputSelector;
+
+	private final TwoInputSelectionHandler inputSelectionHandler;
 
 	private final Object lock;
 
@@ -86,13 +85,9 @@ public class StreamTwoInputSelectableProcessor<IN1, IN2> {
 	private StreamStatus firstStatus;
 	private StreamStatus secondStatus;
 
-	private int availableInputsMask;
-
 	private int lastReadInputIndex;
 
-	private InputSelection inputSelection;
-
-	private Counter numRecordsIn;
+	private final Counter numRecordsIn;
 
 	private boolean isPrepared;
 
@@ -101,18 +96,22 @@ public class StreamTwoInputSelectableProcessor<IN1, IN2> {
 		Collection<InputGate> inputGates2,
 		TypeSerializer<IN1> inputSerializer1,
 		TypeSerializer<IN2> inputSerializer2,
+		StreamTask<?, ?> streamTask,
+		CheckpointingMode checkpointingMode,
 		Object lock,
 		IOManager ioManager,
+		Configuration taskManagerConfig,
 		StreamStatusMaintainer streamStatusMaintainer,
 		TwoInputStreamOperator<IN1, IN2, ?> streamOperator,
+		TwoInputSelectionHandler inputSelectionHandler,
 		WatermarkGauge input1WatermarkGauge,
 		WatermarkGauge input2WatermarkGauge,
-		OperatorChain<?, ?> operatorChain) {
-
-		checkState(streamOperator instanceof InputSelectable);
+		String taskName,
+		OperatorChain<?, ?> operatorChain,
+		Counter numRecordsIn) throws IOException {
 
 		this.streamOperator = checkNotNull(streamOperator);
-		this.inputSelector = (InputSelectable) streamOperator;
+		this.inputSelectionHandler = checkNotNull(inputSelectionHandler);
 
 		this.lock = checkNotNull(lock);
 
@@ -120,8 +119,17 @@ public class StreamTwoInputSelectableProcessor<IN1, IN2> {
 		InputGate unionedInputGate2 = InputGateUtil.createInputGate(inputGates2.toArray(new InputGate[0]));
 
 		// create a Input instance for each input
-		this.input1 = new StreamTaskNetworkInput(new BarrierDiscarder(unionedInputGate1), inputSerializer1, ioManager, 0);
-		this.input2 = new StreamTaskNetworkInput(new BarrierDiscarder(unionedInputGate2), inputSerializer2, ioManager, 1);
+		CheckpointedInputGate[] checkpointedInputGates = InputProcessorUtil.createCheckpointedInputGatePair(
+			streamTask,
+			checkpointingMode,
+			ioManager,
+			unionedInputGate1,
+			unionedInputGate2,
+			taskManagerConfig,
+			taskName);
+		checkState(checkpointedInputGates.length == 2);
+		this.input1 = new StreamTaskNetworkInput(checkpointedInputGates[0], inputSerializer1, ioManager, 0);
+		this.input2 = new StreamTaskNetworkInput(checkpointedInputGates[1], inputSerializer2, ioManager, 1);
 
 		this.statusWatermarkValve1 = new StatusWatermarkValve(
 			unionedInputGate1.getNumberOfInputChannels(),
@@ -131,18 +139,32 @@ public class StreamTwoInputSelectableProcessor<IN1, IN2> {
 			new ForwardingValveOutputHandler(streamOperator, lock, streamStatusMaintainer, input2WatermarkGauge, 1));
 
 		this.operatorChain = checkNotNull(operatorChain);
+		this.numRecordsIn = checkNotNull(numRecordsIn);
 
 		this.firstStatus = StreamStatus.ACTIVE;
 		this.secondStatus = StreamStatus.ACTIVE;
 
-		this.availableInputsMask = (int) new InputSelection.Builder().select(1).select(2).build().getInputMask();
-
 		this.lastReadInputIndex = 1; // always try to read from the first input
 
 		this.isPrepared = false;
-
 	}
 
+	@Override
+	public boolean isFinished() {
+		return input1.isFinished() && input2.isFinished();
+	}
+
+	@Override
+	public CompletableFuture<?> isAvailable() {
+		if (inputSelectionHandler.areAllInputsSelected()) {
+			return isAnyInputAvailable();
+		} else {
+			StreamTaskInput input = (inputSelectionHandler.isFirstInputSelected()) ? input1 : input2;
+			return input.isAvailable();
+		}
+	}
+
+	@Override
 	public boolean processInput() throws Exception {
 		if (!isPrepared) {
 			// the preparations here are not placed in the constructor because all work in it
@@ -162,31 +184,43 @@ public class StreamTwoInputSelectableProcessor<IN1, IN2> {
 			if (recordOrMark != null) {
 				processElement1(recordOrMark, input1.getLastChannel());
 			}
+			checkFinished(input1, lastReadInputIndex);
 		} else {
 			recordOrMark = input2.pollNextNullable();
 			if (recordOrMark != null) {
 				processElement2(recordOrMark, input2.getLastChannel());
 			}
+			checkFinished(input2, lastReadInputIndex);
 		}
 
 		if (recordOrMark == null) {
-			setUnavailableInput(readingInputIndex);
+			inputSelectionHandler.setUnavailableInput(readingInputIndex);
 		}
 
-		return !checkFinished();
+		return recordOrMark != null;
 	}
 
-	public void cleanup() throws Exception {
-		Exception ex = null;
+	private void checkFinished(StreamTaskInput input, int inputIndex) throws Exception {
+		if (input.isFinished()) {
+			synchronized (lock) {
+				operatorChain.endInput(getInputId(inputIndex));
+				inputSelectionHandler.nextSelection();
+			}
+		}
+	}
+
+	@Override
+	public void close() throws IOException {
+		IOException ex = null;
 		try {
 			input1.close();
-		} catch (Exception e) {
+		} catch (IOException e) {
 			ex = ExceptionUtils.firstOrSuppressed(e, ex);
 		}
 
 		try {
 			input2.close();
-		} catch (Exception e) {
+		} catch (IOException e) {
 			ex = ExceptionUtils.firstOrSuppressed(e, ex);
 		}
 
@@ -195,25 +229,45 @@ public class StreamTwoInputSelectableProcessor<IN1, IN2> {
 		}
 	}
 
-	private int selectNextReadingInputIndex()
-		throws InterruptedException, ExecutionException, IOException {
+	private int selectNextReadingInputIndex() throws IOException {
+		updateAvailability();
+		checkInputSelectionAgainstIsFinished();
 
-		int readingInputIndex;
-		while ((readingInputIndex = inputSelection.fairSelectNextIndexOutOf2(availableInputsMask, lastReadInputIndex)) == -1) {
-			if (!waitForAvailableInput(inputSelection)) {
-				return -1;
-			}
+		int readingInputIndex = inputSelectionHandler.selectNextInputIndex(lastReadInputIndex);
+		if (readingInputIndex == -1) {
+			return -1;
 		}
 
 		// to avoid starvation, if the input selection is ALL and availableInputsMask is not ALL,
 		// always try to check and set the availability of another input
 		// TODO: because this can be a costly operation (checking volatile inside CompletableFuture`
 		//  this might be optimized to only check once per processed NetworkBuffer
-		if (availableInputsMask < 3 && inputSelection.isALLMaskOf2()) {
+		if (inputSelectionHandler.shouldSetAvailableForAnotherInput()) {
 			checkAndSetAvailable(1 - readingInputIndex);
 		}
 
 		return readingInputIndex;
+	}
+
+	private void checkInputSelectionAgainstIsFinished() throws IOException {
+		if (inputSelectionHandler.areAllInputsSelected()) {
+			return;
+		}
+		if (inputSelectionHandler.isFirstInputSelected() && input1.isFinished()) {
+			throw new IOException("Can not make a progress: only first input is selected but it is already finished");
+		}
+		if (inputSelectionHandler.isSecondInputSelected() && input2.isFinished()) {
+			throw new IOException("Can not make a progress: only second input is selected but it is already finished");
+		}
+	}
+
+	private void updateAvailability() {
+		if (!input1.isFinished() && input1.isAvailable() == AVAILABLE) {
+			inputSelectionHandler.setAvailableInput(input1.getInputIndex());
+		}
+		if (!input2.isFinished() && input2.isAvailable() == AVAILABLE) {
+			inputSelectionHandler.setAvailableInput(input2.getInputIndex());
+		}
 	}
 
 	private void processElement1(StreamElement recordOrMark, int channel) throws Exception {
@@ -223,7 +277,7 @@ public class StreamTwoInputSelectableProcessor<IN1, IN2> {
 				numRecordsIn.inc();
 				streamOperator.setKeyContextElement1(record);
 				streamOperator.processElement1(record);
-				inputSelection = inputSelector.nextSelection();
+				inputSelectionHandler.nextSelection();
 			}
 		}
 		else if (recordOrMark.isWatermark()) {
@@ -246,7 +300,7 @@ public class StreamTwoInputSelectableProcessor<IN1, IN2> {
 				numRecordsIn.inc();
 				streamOperator.setKeyContextElement2(record);
 				streamOperator.processElement2(record);
-				inputSelection = inputSelector.nextSelection();
+				inputSelectionHandler.nextSelection();
 			}
 		}
 		else if (recordOrMark.isWatermark()) {
@@ -266,15 +320,7 @@ public class StreamTwoInputSelectableProcessor<IN1, IN2> {
 		// Note: the first call to nextSelection () on the operator must be made after this operator
 		// is opened to ensure that any changes about the input selection in its open()
 		// method take effect.
-		inputSelection = inputSelector.nextSelection();
-
-		try {
-			numRecordsIn = ((OperatorMetricGroup) streamOperator
-				.getMetricGroup()).getIOMetricGroup().getNumRecordsInCounter();
-		} catch (Exception e) {
-			LOG.warn("An exception occurred during the metrics setup.", e);
-			numRecordsIn = new SimpleCounter();
-		}
+		inputSelectionHandler.nextSelection();
 
 		isPrepared = true;
 	}
@@ -282,77 +328,24 @@ public class StreamTwoInputSelectableProcessor<IN1, IN2> {
 	private void checkAndSetAvailable(int inputIndex) {
 		StreamTaskInput input = getInput(inputIndex);
 		if (!input.isFinished() && input.isAvailable().isDone()) {
-			setAvailableInput(inputIndex);
+			inputSelectionHandler.setAvailableInput(inputIndex);
 		}
 	}
 
-	/**
-	 * @return false if both of the inputs are finished, true otherwise.
-	 */
-	private boolean waitForAvailableInput(InputSelection inputSelection)
-		throws ExecutionException, InterruptedException, IOException {
-
-		if (inputSelection.isALLMaskOf2()) {
-			return waitForAvailableEitherInput();
-		} else {
-			waitForOneInput(
-				(inputSelection.getInputMask() == InputSelection.FIRST.getInputMask()) ? input1 : input2);
-			return true;
-		}
-	}
-
-	private boolean waitForAvailableEitherInput()
-		throws ExecutionException, InterruptedException {
-
-		CompletableFuture<?> future1 = input1.isFinished() ? UNAVAILABLE : input1.isAvailable();
-		CompletableFuture<?> future2 = input2.isFinished() ? UNAVAILABLE : input2.isAvailable();
-
-		if (future1 == UNAVAILABLE && future2 == UNAVAILABLE) {
-			return false;
+	private CompletableFuture<?> isAnyInputAvailable() {
+		if (input1.isFinished()) {
+			return input2.isFinished() ? AVAILABLE : input2.isAvailable();
 		}
 
-		// block to wait for a available input
-		CompletableFuture.anyOf(future1, future2).get();
-
-		if (future1.isDone()) {
-			setAvailableInput(input1.getInputIndex());
-		}
-		if (future2.isDone()) {
-			setAvailableInput(input2.getInputIndex());
+		if (input2.isFinished()) {
+			return input1.isAvailable();
 		}
 
-		return true;
-	}
+		CompletableFuture<?> input1Available = input1.isAvailable();
+		CompletableFuture<?> input2Available = input2.isAvailable();
 
-	private void waitForOneInput(StreamTaskInput input)
-		throws IOException, ExecutionException, InterruptedException {
-
-		if (input.isFinished()) {
-			throw new IOException("Could not read the finished input: input" + (input.getInputIndex() + 1) +  ".");
-		}
-
-		input.isAvailable().get();
-		setAvailableInput(input.getInputIndex());
-	}
-
-	private boolean checkFinished() throws Exception {
-		if (getInput(lastReadInputIndex).isFinished()) {
-			inputSelection = (lastReadInputIndex == 0) ? InputSelection.SECOND : InputSelection.FIRST;
-
-			synchronized (lock) {
-				operatorChain.endInput(getInputId(lastReadInputIndex));
-			}
-		}
-
-		return input1.isFinished() && input2.isFinished();
-	}
-
-	private void setAvailableInput(int inputIndex) {
-		availableInputsMask |= 1 << inputIndex;
-	}
-
-	private void setUnavailableInput(int inputIndex) {
-		availableInputsMask &= ~(1 << inputIndex);
+		return (input1Available == AVAILABLE || input2Available == AVAILABLE) ?
+			AVAILABLE : CompletableFuture.anyOf(input1Available, input2Available);
 	}
 
 	private StreamTaskInput getInput(int inputIndex) {
@@ -393,49 +386,39 @@ public class StreamTwoInputSelectableProcessor<IN1, IN2> {
 		}
 
 		@Override
-		public void handleWatermark(Watermark watermark) {
-			try {
-				synchronized (lock) {
-					inputWatermarkGauge.setCurrentWatermark(watermark.getTimestamp());
-					if (inputIndex == 0) {
-						operator.processWatermark1(watermark);
-					} else {
-						operator.processWatermark2(watermark);
-					}
+		public void handleWatermark(Watermark watermark) throws Exception {
+			synchronized (lock) {
+				inputWatermarkGauge.setCurrentWatermark(watermark.getTimestamp());
+				if (inputIndex == 0) {
+					operator.processWatermark1(watermark);
+				} else {
+					operator.processWatermark2(watermark);
 				}
-			} catch (Exception e) {
-				throw new RuntimeException("Exception occurred while processing valve output watermark of input"
-					+ (inputIndex + 1) + ": ", e);
 			}
 		}
 
 		@Override
 		public void handleStreamStatus(StreamStatus streamStatus) {
-			try {
-				synchronized (lock) {
-					final StreamStatus anotherStreamStatus;
-					if (inputIndex == 0) {
-						firstStatus = streamStatus;
-						anotherStreamStatus = secondStatus;
-					} else {
-						secondStatus = streamStatus;
-						anotherStreamStatus = firstStatus;
-					}
+			synchronized (lock) {
+				final StreamStatus anotherStreamStatus;
+				if (inputIndex == 0) {
+					firstStatus = streamStatus;
+					anotherStreamStatus = secondStatus;
+				} else {
+					secondStatus = streamStatus;
+					anotherStreamStatus = firstStatus;
+				}
 
-					// check if we need to toggle the task's stream status
-					if (!streamStatus.equals(streamStatusMaintainer.getStreamStatus())) {
-						if (streamStatus.isActive()) {
-							// we're no longer idle if at least one input has become active
-							streamStatusMaintainer.toggleStreamStatus(StreamStatus.ACTIVE);
-						} else if (anotherStreamStatus.isIdle()) {
-							// we're idle once both inputs are idle
-							streamStatusMaintainer.toggleStreamStatus(StreamStatus.IDLE);
-						}
+				// check if we need to toggle the task's stream status
+				if (!streamStatus.equals(streamStatusMaintainer.getStreamStatus())) {
+					if (streamStatus.isActive()) {
+						// we're no longer idle if at least one input has become active
+						streamStatusMaintainer.toggleStreamStatus(StreamStatus.ACTIVE);
+					} else if (anotherStreamStatus.isIdle()) {
+						// we're idle once both inputs are idle
+						streamStatusMaintainer.toggleStreamStatus(StreamStatus.IDLE);
 					}
 				}
-			} catch (Exception e) {
-				throw new RuntimeException("Exception occurred while processing valve output stream status of input"
-					+ (inputIndex + 1) + ": ", e);
 			}
 		}
 	}

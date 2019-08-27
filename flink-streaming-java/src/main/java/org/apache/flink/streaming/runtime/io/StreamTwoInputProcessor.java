@@ -56,6 +56,7 @@ import java.io.IOException;
 import java.util.BitSet;
 import java.util.Collection;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 
 import static org.apache.flink.util.Preconditions.checkNotNull;
 
@@ -75,7 +76,7 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
  * @param <IN2> The type of the records that arrive on the second input
  */
 @Internal
-public class StreamTwoInputProcessor<IN1, IN2> {
+public final class StreamTwoInputProcessor<IN1, IN2> implements StreamInputProcessor {
 
 	private static final Logger LOG = LoggerFactory.getLogger(StreamTwoInputProcessor.class);
 
@@ -86,7 +87,7 @@ public class StreamTwoInputProcessor<IN1, IN2> {
 	private final DeserializationDelegate<StreamElement> deserializationDelegate1;
 	private final DeserializationDelegate<StreamElement> deserializationDelegate2;
 
-	private final CheckpointBarrierHandler barrierHandler;
+	private final CheckpointedInputGate barrierHandler;
 
 	private final Object lock;
 
@@ -154,7 +155,7 @@ public class StreamTwoInputProcessor<IN1, IN2> {
 
 		final InputGate inputGate = InputGateUtil.createInputGate(inputGates1, inputGates2);
 
-		this.barrierHandler = InputProcessorUtil.createCheckpointBarrierHandler(
+		this.barrierHandler = InputProcessorUtil.createCheckpointedInputGate(
 			checkpointedTask,
 			checkpointMode,
 			ioManager,
@@ -206,6 +207,20 @@ public class StreamTwoInputProcessor<IN1, IN2> {
 		this.finishedChannels2 = new BitSet();
 	}
 
+	@Override
+	public boolean isFinished() {
+		return isFinished;
+	}
+
+	@Override
+	public CompletableFuture<?> isAvailable() {
+		if (currentRecordDeserializer != null) {
+			return AVAILABLE;
+		}
+		return barrierHandler.isAvailable();
+	}
+
+	@Override
 	public boolean processInput() throws Exception {
 		if (isFinished) {
 			return false;
@@ -258,7 +273,6 @@ public class StreamTwoInputProcessor<IN1, IN2> {
 								streamOperator.processElement1(record);
 							}
 							return true;
-
 						}
 					}
 					else {
@@ -294,15 +308,13 @@ public class StreamTwoInputProcessor<IN1, IN2> {
 			if (bufferOrEvent.isPresent()) {
 				processBufferOrEvent(bufferOrEvent.get());
 			} else {
-				if (!barrierHandler.isFinished()) {
-					barrierHandler.isAvailable().get();
-				} else {
+				if (barrierHandler.isFinished()) {
 					isFinished = true;
 					if (!barrierHandler.isEmpty()) {
 						throw new IllegalStateException("Trailing data in checkpoint barrier handler.");
 					}
-					return false;
 				}
+				return false;
 			}
 		}
 	}
@@ -320,8 +332,13 @@ public class StreamTwoInputProcessor<IN1, IN2> {
 			if (event.getClass() != EndOfPartitionEvent.class) {
 				throw new IOException("Unexpected event: " + event);
 			}
+			int channelIndex = bufferOrEvent.getChannelIndex();
 
-			handleEndOfPartitionEvent(bufferOrEvent.getChannelIndex());
+			handleEndOfPartitionEvent(channelIndex);
+
+			// release the record deserializer immediately,
+			// which is very valuable in case of bounded stream
+			releaseDeserializer(channelIndex);
 		}
 	}
 
@@ -347,18 +364,29 @@ public class StreamTwoInputProcessor<IN1, IN2> {
 		}
 	}
 
-	public void cleanup() throws IOException {
-		// clear the buffers first. this part should not ever fail
-		for (RecordDeserializer<?> deserializer : recordDeserializers) {
+	@Override
+	public void close() throws IOException {
+		// release the deserializers first. this part should not ever fail
+		for (int channelIndex = 0; channelIndex < recordDeserializers.length; channelIndex++) {
+			releaseDeserializer(channelIndex);
+		}
+
+		// cleanup the barrier handler resources
+		barrierHandler.cleanup();
+	}
+
+	private void releaseDeserializer(int channelIndex) {
+		RecordDeserializer<?> deserializer = recordDeserializers[channelIndex];
+		if (deserializer != null) {
+			// recycle buffers and clear the deserializer.
 			Buffer buffer = deserializer.getCurrentBuffer();
 			if (buffer != null && !buffer.isRecycled()) {
 				buffer.recycleBuffer();
 			}
 			deserializer.clear();
-		}
 
-		// cleanup the barrier handler resources
-		barrierHandler.cleanup();
+			recordDeserializers[channelIndex] = null;
+		}
 	}
 
 	private class ForwardingValveOutputHandler1 implements StatusWatermarkValve.ValveOutputHandler {

@@ -55,17 +55,23 @@ import java.util.Collection;
  * {@link ShuffleEnvironment#createResultPartitionWriters}. The created writers are grouped per owner.
  * The owner is responsible for the writers' lifecycle from the moment of creation.
  *
- * <p>Partitions are released in the following cases:
+ * <p>Partitions are fully released in the following cases:
  * <ol>
  *     <li>{@link ResultPartitionWriter#fail(Throwable)} and {@link ResultPartitionWriter#close()} are called
  *     if the production has failed.
  *     </li>
- *     <li>{@link ResultPartitionWriter#finish()} and {@link ResultPartitionWriter#close()} are called
- *     if the production is done. The actual release can take some time depending on implementation details,
- *     e.g. if the `end of consumption' confirmation from the consumer is being awaited implicitly
- *     or the partition is later released by {@link ShuffleEnvironment#releasePartitions(Collection)}.</li>
- *     <li>{@link ShuffleEnvironment#releasePartitions(Collection)} is called outside of the producer thread,
- *     e.g. to manage the lifecycle of BLOCKING result partitions which can outlive their producers.</li>
+ *     <li>for PIPELINED partitions if there was a detected consumption attempt and it either failed or finished
+ *     after the bounded production has been done ({@link ResultPartitionWriter#finish()} and
+ *     {@link ResultPartitionWriter#close()} have been called). Only one consumption attempt is ever expected for
+ *     the PIPELINED partition at the moment so it can be released afterwards.
+ *     <li>if the following methods are called outside of the producer thread:
+ *     <ol>
+ *         <li>{@link ShuffleMaster#releasePartitionExternally(ShuffleDescriptor)}</li>
+ *         <li>and if it occupies any producer local resources ({@link ShuffleDescriptor#storesLocalResourcesOn()})
+ *             then also {@link ShuffleEnvironment#releasePartitionsLocally(Collection)}</li>
+ *     </ol>
+ *     e.g. to manage the lifecycle of BLOCKING result partitions which can outlive their producers.
+ *     The BLOCKING partitions can be consumed multiple times.</li>
  * </ol>
  * The partitions, which currently still occupy local resources, can be queried with
  * {@link ShuffleEnvironment#getPartitionsOccupyingLocalResources}.
@@ -124,9 +130,12 @@ public interface ShuffleEnvironment<P extends ResultPartitionWriter, G extends I
 	/**
 	 * Release local resources occupied by the given partitions.
 	 *
+	 * <p>This is called for partitions which occupy resources locally
+	 * (can be checked by {@link ShuffleDescriptor#storesLocalResourcesOn()}).
+	 *
 	 * @param partitionIds identifying the partitions to be released
 	 */
-	void releasePartitions(Collection<ResultPartitionID> partitionIds);
+	void releasePartitionsLocally(Collection<ResultPartitionID> partitionIds);
 
 	/**
 	 * Report partitions which still occupy some resources locally.
